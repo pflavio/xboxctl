@@ -6,6 +6,7 @@ mod holders;
 #[cfg(target_os = "macos")]
 mod iokit;
 mod live;
+mod probe;
 #[cfg(unix)]
 mod sys;
 mod usb;
@@ -22,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-use usb::{Controller, UsbLink};
+use usb::{Controller, Transport, UsbLink};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,8 +52,21 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List connected Xbox (GIP) controllers.
+    /// List connected Xbox controllers, including Nano HID devices.
     List,
+    /// Capture USB and cached HID descriptors as JSON, without claiming the
+    /// controller or sending protocol commands. Serial numbers are omitted.
+    Probe {
+        /// Controller to inspect, as BUS:ADDRESS from `xboxctl list`.
+        #[arg(long, conflicts_with = "all")]
+        device: Option<String>,
+        /// Capture every detected controller, including a GIP comparison device.
+        #[arg(long)]
+        all: bool,
+        /// Write the report to a new file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Show a controller's identity and firmware versions. Read-only.
     Info {
         /// Controller to use, as BUS:ADDRESS from `xboxctl list`.
@@ -164,6 +178,16 @@ fn main() {
     match cli.command {
         Command::List => {
             if let Err(error) = list() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        Command::Probe {
+            device,
+            all,
+            output,
+        } => {
+            if let Err(error) = probe::run(device.as_deref(), all, output.as_deref()) {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -415,9 +439,18 @@ fn no_response_hint(controller: &Controller, error: &str) -> String {
 
 fn describe(controller: &Controller) -> String {
     let (name, codename) = controller.model();
-    let (major, minor) = controller.firmware_major_minor();
+    let version = match controller.transport {
+        Transport::Gip => {
+            let (major, minor) = controller.firmware_major_minor();
+            format!("firmware {major}.{minor}")
+        }
+        Transport::NanoHid => format!(
+            "USB revision {:#06x}  (HID; inspection only)",
+            controller.bcd_device
+        ),
+    };
     format!(
-        "{}  {:04x}:{:04x}  {name}{}  firmware {major}.{minor}",
+        "{}  {:04x}:{:04x}  {name}{}  {version}",
         controller.location(),
         controller.vendor_id,
         controller.product_id,
@@ -477,6 +510,15 @@ fn list() -> Result<(), String> {
 fn info(device: Option<&str>, trace: bool) -> Result<(), String> {
     let controller = usb::select_controller(device)?;
     println!("{}", describe(&controller));
+    if controller.transport == Transport::NanoHid {
+        println!(
+            "Firmware versions and the update protocol are not yet available over Nano HID.\n\
+             The USB device revision (bcdDevice) is not a confirmed firmware version.\n\
+             Capture descriptors with: xboxctl probe --device {}",
+            controller.location()
+        );
+        return Ok(());
+    }
     let mut link = UsbLink::open(&controller, trace)?;
     print_info(&controller, &mut link)
 }
@@ -595,13 +637,40 @@ fn update(
     yes: bool,
     trace: bool,
 ) -> Result<(), String> {
+    // Select once and reject a known unsupported transport before downloading
+    // firmware or opening a USB handle. Keep offline package inspection when
+    // `update <file> --dry-run` has no selectable controller.
+    let selected = usb::select_controller(device).and_then(|controller| {
+        controller.require_gip()?;
+        Ok(controller)
+    });
+    update_selected(image, selected, dry_run, yes, trace)
+}
+
+/// A failed selection (including an unsupported transport) still permits
+/// inspecting a local package with --dry-run. All paths that could talk to a
+/// controller or download firmware require a supported selection first.
+fn update_selected(
+    image: Option<&Path>,
+    selected: Result<Controller, String>,
+    dry_run: bool,
+    yes: bool,
+    trace: bool,
+) -> Result<(), String> {
+    if !dry_run {
+        selected.as_ref().map_err(Clone::clone)?;
+    }
     let package = match image {
         Some(image) => {
             let bytes = fs::read(image)
                 .map_err(|error| format!("could not read {}: {error}", image.display()))?;
             Package::parse(&bytes)?
         }
-        None => download(device, None, None)?.1,
+        None => {
+            let controller = selected.as_ref().map_err(Clone::clone)?;
+            let id = format!("{:04x}:{:04x}", controller.vendor_id, controller.product_id);
+            download(None, Some(&id), None)?.1
+        }
     };
     println!(
         "Package: firmware {} for {:04x}:{:04x}",
@@ -624,7 +693,7 @@ fn update(
         }
     }
 
-    let controller = match usb::select_controller(device) {
+    let controller = match selected {
         Ok(controller) => controller,
         Err(error) if dry_run => {
             println!("Not comparing with a controller: {error}");
@@ -871,4 +940,93 @@ fn start_device(link: &mut UsbLink) -> Result<Option<Hello>, String> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn probe_allows_a_pair_capture_but_not_an_ambiguous_selector() {
+        assert!(
+            Cli::try_parse_from(["xboxctl", "probe", "--all", "--output", "capture.json"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["xboxctl", "probe", "--device", "003:014"]).is_ok());
+        assert!(Cli::try_parse_from(["xboxctl", "probe", "--all", "--device", "003:014"]).is_err());
+    }
+
+    #[test]
+    fn offline_dry_run_accepts_a_local_image_argument() {
+        assert!(matches!(
+            Cli::try_parse_from(["xboxctl", "update", "package.bin", "--dry-run"])
+                .unwrap()
+                .command,
+            Command::Update {
+                image: Some(_),
+                latest: false,
+                dry_run: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn offline_package_inspection_works_with_no_controller_or_nano_hid() {
+        use crate::gip::rdhm::Component;
+
+        let path = std::env::temp_dir().join(format!(
+            "xboxctl-offline-inspection-{}.bin",
+            std::process::id()
+        ));
+        let package = Package {
+            vendor_id: 0x045e,
+            product_id: 0x0b12,
+            version: Version([5, 23, 6, 0]),
+            components: vec![Component {
+                id: 3,
+                flags: 0,
+                target_address: 0x1002_7000,
+                version: Version([5, 23, 6, 0]),
+                data: vec![0xaa; 16],
+            }],
+        };
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&package.to_bytes()).unwrap();
+        drop(file);
+        let results = [
+            "no Xbox controller found".to_owned(),
+            Transport::NanoHid.require_gip().unwrap_err(),
+        ]
+        .map(|error| update_selected(Some(&path), Err(error), true, false, false));
+        fs::remove_file(path).unwrap();
+        for result in results {
+            assert!(result.is_ok(), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn unsupported_transport_stops_before_firmware_reads_or_downloads() {
+        let error = Transport::NanoHid.require_gip().unwrap_err();
+        // A real update must fail with the transport explanation, without
+        // trying to read this nonexistent image or opening any USB handle.
+        assert_eq!(
+            update_selected(
+                Some(Path::new("nonexistent-nano-firmware.bin")),
+                Err(error.clone()),
+                false,
+                true,
+                false,
+            ),
+            Err(error.clone())
+        );
+        // --latest --dry-run must also stop before a firmware feed request.
+        assert_eq!(
+            update_selected(None, Err(error.clone()), true, false, false),
+            Err(error)
+        );
+    }
 }

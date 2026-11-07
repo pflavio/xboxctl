@@ -38,7 +38,13 @@ Wireless Adapter or Bluetooth are not supported.
 The original Xbox One controller uses a legacy update protocol that `xboxctl`
 does not support.
 
-Untested controllers may well work: `xboxctl info` and `xboxctl update --latest
+The **Xbox Nano Controller (`045e:0b4e`)** is recognized in USB HID mode by
+`list`, `info` and `probe`. Support is experimental and limited to identification
+and descriptor capture; Nano firmware updates, rumble, calibration and live
+diagnostics are not implemented. See [Nano support and investigation]({% link nano.md %})
+for Linux capture instructions and the evidence still needed for an updater.
+
+Untested GIP controllers may well work: `xboxctl info` and `xboxctl update --latest
 --dry-run` are read-only and show whether a controller speaks the update
 protocol and what an update would change. If you try one, please
 [open an issue](https://github.com/bb441db/xboxctl/issues) with the result.
@@ -81,6 +87,8 @@ Using a Steam Deck or another SteamOS device? Follow the
 ```bash
 xboxctl list                       # connected controllers (read-only)
 xboxctl info                       # identity and per-component firmware versions (read-only)
+xboxctl probe --all                # USB/HID descriptor report as JSON; no protocol commands
+xboxctl probe --all --output capture.json  # save a new report file; serial numbers omitted
 xboxctl download                   # current firmware for the connected model
 xboxctl download --list            # every model in Microsoft's feed
 xboxctl update --latest --dry-run  # compare the controller with the current firmware

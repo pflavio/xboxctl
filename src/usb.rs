@@ -1,5 +1,5 @@
-//! GIP transport over libusb: controller discovery and the interrupt
-//! endpoints of interface 0.
+//! Controller discovery and the GIP transport over libusb. The Nano's HID
+//! interface is discoverable for inspection but cannot use the GIP link.
 
 use crate::{gip::updater::Link, holders};
 use std::{
@@ -20,10 +20,33 @@ type Handle = rusb::DeviceHandle<rusb::GlobalContext>;
 
 /// GIP data interface: vendor class 0xff, subclass 0x47, protocol 0xd0.
 const GIP_INTERFACE_CLASS: (u8, u8, u8) = (0xff, 0x47, 0xd0);
+const NANO_ID: (u16, u16) = (0x045e, 0x0b4e);
 /// How long a restarting controller may stay away before asking for a replug.
 const REPLUG_HINT_AFTER: Duration = Duration::from_secs(15);
 
-/// A GIP controller found on the USB bus.
+/// The interface protocol observed in a normal USB configuration descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Gip,
+    /// Recognition and descriptor capture only; no update protocol is known.
+    NanoHid,
+}
+
+impl Transport {
+    pub fn require_gip(self) -> Result<(), String> {
+        match self {
+            Self::Gip => Ok(()),
+            Self::NanoHid => Err(
+                "Xbox Nano is using USB HID; its firmware update, rumble and calibration \
+                 protocols are not implemented. Use `xboxctl probe` to capture descriptors. \
+                 No GIP commands were sent."
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+/// A supported GIP controller or an inspectable Nano found on the USB bus.
 pub struct Controller {
     pub device: rusb::Device<rusb::GlobalContext>,
     pub bus: u8,
@@ -31,6 +54,7 @@ pub struct Controller {
     pub vendor_id: u16,
     pub product_id: u16,
     pub bcd_device: u16,
+    pub transport: Transport,
 }
 
 impl Controller {
@@ -45,6 +69,7 @@ impl Controller {
             (0x045e, 0x0b0a) => ("Xbox Adaptive Controller", Some("ZEPH")),
             (0x045e, 0x0b1a | 0x0b1c) => ("Xbox Adaptive Joystick", Some("DURA")),
             (0x045e, 0x0b12) => ("Xbox Series X|S Controller", Some("MERL")),
+            NANO_ID => ("Xbox Nano Controller", None),
             _ => ("GIP controller", None),
         }
     }
@@ -68,32 +93,64 @@ impl Controller {
     pub fn location(&self) -> String {
         format!("{:03}:{:03}", self.bus, self.address)
     }
+
+    pub fn require_gip(&self) -> Result<(), String> {
+        self.transport
+            .require_gip()
+            .map_err(|error| format!("{}: {error}", self.location()))
+    }
 }
 
-fn is_gip(device: &rusb::Device<rusb::GlobalContext>) -> bool {
-    let Ok(config) = device.config_descriptor(0) else {
-        return false;
-    };
-    config
-        .interfaces()
-        .flat_map(|interface| interface.descriptors())
-        .any(|descriptor| {
-            (
-                descriptor.class_code(),
-                descriptor.sub_class_code(),
-                descriptor.protocol_code(),
-            ) == GIP_INTERFACE_CLASS
-        })
+/// Classify interface descriptors, never the device class or the other-speed
+/// device qualifier. In particular, a shared OUT endpoint address does not
+/// imply that HID carries GIP. Recognize only the known Nano VID/PID as HID.
+fn classify_transport(
+    ids: (u16, u16),
+    classes: impl IntoIterator<Item = (u8, u8, u8)>,
+) -> Option<Transport> {
+    let mut gip = false;
+    let mut nano_hid = false;
+    for class in classes {
+        gip |= class == GIP_INTERFACE_CLASS;
+        nano_hid |= ids == NANO_ID && class.0 == 0x03;
+    }
+    // If a Nano exposes both, keep it on the inspection-only path until its
+    // update transport has been verified.
+    if nano_hid {
+        Some(Transport::NanoHid)
+    } else if gip {
+        Some(Transport::Gip)
+    } else {
+        None
+    }
 }
 
-/// Every GIP controller on the bus. Reads descriptors only; nothing is opened.
+fn transport(device: &rusb::Device<rusb::GlobalContext>) -> Option<Transport> {
+    let descriptor = device.device_descriptor().ok()?;
+    let config = device.config_descriptor(0).ok()?;
+    classify_transport(
+        (descriptor.vendor_id(), descriptor.product_id()),
+        config.interfaces().flat_map(|interface| {
+            interface.descriptors().map(|descriptor| {
+                (
+                    descriptor.class_code(),
+                    descriptor.sub_class_code(),
+                    descriptor.protocol_code(),
+                )
+            })
+        }),
+    )
+}
+
+/// Every GIP controller and known Nano HID on the bus. Reads descriptors only;
+/// nothing is opened and no kernel driver is detached.
 pub fn find_controllers() -> Result<Vec<Controller>, String> {
     let devices =
         rusb::devices().map_err(|error| format!("could not list USB devices: {error}"))?;
     Ok(devices
         .iter()
-        .filter(is_gip)
         .filter_map(|device| {
+            let transport = transport(&device)?;
             let descriptor = device.device_descriptor().ok()?;
             let version = descriptor.device_version();
             Some(Controller {
@@ -107,6 +164,7 @@ pub fn find_controllers() -> Result<Vec<Controller>, String> {
                     | u16::from(version.major() % 10) << 8
                     | u16::from(version.minor()) << 4
                     | u16::from(version.sub_minor()),
+                transport,
                 device,
             })
         })
@@ -130,7 +188,11 @@ fn microsoft_devices() -> String {
                     device.address(),
                     descriptor.vendor_id(),
                     descriptor.product_id(),
-                    if is_gip(&device) { " (GIP)" } else { "" }
+                    if transport(&device) == Some(Transport::Gip) {
+                        " (GIP)"
+                    } else {
+                        ""
+                    }
                 )
             })
         })
@@ -154,7 +216,7 @@ pub fn select_controller(location: Option<&str>) -> Result<Controller, String> {
             controllers
                 .into_iter()
                 .find(|c| c.bus == bus && c.address == address)
-                .ok_or_else(|| format!("no GIP controller at {location}"))
+                .ok_or_else(|| format!("no Xbox controller at {location}"))
         }
         None => match controllers.len() {
             0 => Err("no Xbox controller found".to_owned()),
@@ -236,6 +298,11 @@ fn access_error(subject: &str, vendor_id: u16, product_id: u16) -> String {
 /// Open the controller and claim interface 0, detaching `xpad` (it is
 /// reattached when the interface is released).
 fn claim(controller: &Controller) -> Result<Handle, rusb::Error> {
+    // This is also reached directly by reconnect. Reject before opening or
+    // detaching anything, even if a controller re-enumerates as HID.
+    if controller.transport != Transport::Gip {
+        return Err(rusb::Error::NotSupported);
+    }
     let handle = controller.device.open()?;
     let _ = handle.set_auto_detach_kernel_driver(true);
     handle.claim_interface(INTERFACE)?;
@@ -257,6 +324,7 @@ pub struct UsbLink {
 
 impl UsbLink {
     pub fn open(controller: &Controller, trace: bool) -> Result<Self, String> {
+        controller.require_gip()?;
         let handle = claim(controller).map_err(|error| match error {
             rusb::Error::Access => access_error(
                 &controller.location(),
@@ -386,10 +454,9 @@ impl Link for UsbLink {
                     seen = Some(devices);
                 }
             }
-            for controller in find_controllers()?
-                .into_iter()
-                .filter(|c| (c.vendor_id, c.product_id) == self.ids)
-            {
+            for controller in find_controllers()?.into_iter().filter(|c| {
+                c.transport == Transport::Gip && (c.vendor_id, c.product_id) == self.ids
+            }) {
                 // Right after re-enumeration udev may not have applied the
                 // uaccess permission yet, and xpad may still be binding.
                 match claim(&controller) {
@@ -490,4 +557,49 @@ pub fn hex(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nano_hid_is_recognized_without_treating_it_as_gip() {
+        assert_eq!(
+            classify_transport(NANO_ID, [(0x03, 0x00, 0x00)]),
+            Some(Transport::NanoHid)
+        );
+        let error = Transport::NanoHid.require_gip().unwrap_err();
+        assert!(error.contains("USB HID"));
+        assert!(error.contains("probe"));
+    }
+
+    #[test]
+    fn existing_gip_controllers_keep_their_transport() {
+        for ids in [(0x045e, 0x0b12), (0x045e, 0x02ea), (0x2e95, 0x0504)] {
+            assert_eq!(
+                classify_transport(ids, [GIP_INTERFACE_CLASS]),
+                Some(Transport::Gip)
+            );
+        }
+        assert!(Transport::Gip.require_gip().is_ok());
+    }
+
+    #[test]
+    fn unrelated_hid_devices_are_not_xbox_controllers() {
+        for ids in [(0x045e, 0x0001), (0x1234, 0x0b4e), (0x045e, 0x0b12)] {
+            assert_eq!(classify_transport(ids, [(0x03, 0, 0)]), None);
+        }
+    }
+
+    #[test]
+    fn only_interface_classes_establish_gip_support() {
+        assert_eq!(classify_transport(NANO_ID, []), None);
+        assert_eq!(classify_transport(NANO_ID, [(0xef, 0x02, 0x01)]), None);
+        assert_eq!(classify_transport(NANO_ID, [(0xff, 0x47, 0x00)]), None);
+        assert_eq!(
+            classify_transport(NANO_ID, [(0x03, 0, 0), GIP_INTERFACE_CLASS]),
+            Some(Transport::NanoHid)
+        );
+    }
 }
