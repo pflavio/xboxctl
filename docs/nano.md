@@ -70,7 +70,7 @@ Connect the Nano and a regular Xbox Series X|S controller with USB data
 cables. From this branch's checkout, with Rust and Cargo installed, run:
 
 ```bash
-cargo build --release --locked
+env CI_VERSION=0.8.1-nano.1 cargo build --release --locked
 ./target/release/xboxctl list
 ./target/release/xboxctl probe --all --output nano-and-series.json
 ```
@@ -117,3 +117,75 @@ Firmware support requires evidence for the transport, package matching,
 transfer acknowledgements, restart behavior and recovery. Keep Nano protocol
 writes disabled until that evidence supports an implementation, and use the
 Series controller to check that the existing GIP path continues to work.
+
+## GIP reconnect code review
+
+In [`Updater::reset_and_resume`](https://github.com/bb441db/xboxctl/blob/0.8.1/src/gip/updater.rs), `Event::Reconnected`
+is emitted immediately after `link.reconnect()` returns, before the Start
+packet is sent. Consequently, "controller is back, continuing" means that
+the USB handle was reopened; it does not confirm that Start or the next
+UFU request succeeded. An error from the following Start write propagates
+to the caller.
+
+The existing [`UsbLink`](https://github.com/bb441db/xboxctl/blob/0.8.1/src/usb.rs) implementation has several useful
+investigation points:
+
+- The reader stops on any non-timeout USB error, and reconnect treats an
+  error or a closed reader channel as disconnection. Trace whether the old
+  USB enumeration has actually disappeared before accepting a new handle.
+- `start` launches the reader and returns without checking whether that
+  reader has already failed. Record claim success, reader errors and Start
+  submission/result with monotonic timestamps.
+- Reopening reads the serial number in `reconnect` and again in `start`.
+  Measure this latency relative to Hello and Start before changing timing.
+- `send` logs outgoing packets only after successful writes. Diagnostic
+  instrumentation should identify an attempted command even when it fails.
+
+These are code paths to instrument, not evidence of a particular hardware
+failure's cause. The simulated updater tests do not reproduce a physical USB
+re-enumeration race. Measure the hardware behavior before changing timing
+or retry semantics.
+
+The debug-only `test reset` command exercises Reset, USB reconnect, Start
+and GetInfo without writing firmware. It is a deliberate controller restart,
+not a passive descriptor read. If this investigation is pursued, select the
+Series controller's current `BUS:ADDRESS` from `list` and use:
+
+```bash
+cargo build --locked
+sudo ./target/debug/xboxctl --trace-packets test reset --device BUS:ADDRESS
+```
+
+This diagnostic waits up to one second for Hello before sending Start, while
+the updater sends Start immediately after reopening, so it is not an exact
+timing reproduction. Keep raw traces local until unique device identifiers
+have been removed. The descriptor capture and this runtime reset diagnostic
+can both be performed without a firmware flash.
+
+## Continuing development in a local checkout
+
+The implementation starting point is commit `d7d2c55` on
+`feat/nano-hid-support`: Nano discovery and inspection, the JSON probe,
+GIP transport guards and preservation of local-package dry runs. At that
+commit, 82 tests passed, one existing official-package test was ignored,
+Clippy passed with warnings denied, and the release build succeeded.
+
+The next hardware step is still the Nano-and-Series descriptor capture above.
+No Nano HID report descriptor bytes have yet been captured in this project,
+and Nano firmware flashing remains unimplemented. A local coding agent can
+build the branch, read the attached devices' descriptors and inspect the JSON
+on the same Linux machine. Read this page and the current diff before making
+further changes, and preserve the distinction between descriptor evidence
+and unverified command semantics.
+
+The official feed schema is implemented in [`src/feed.rs`](https://github.com/bb441db/xboxctl/blob/0.8.1/src/feed.rs):
+`g` is the feed name, `v` its version, `p` the firmware base URL and `d` the
+device entries. Entries use `id`, `__n`, `f` and `req`; each firmware file's
+`p` is joined to the top-level base URL. On rechecking both feeds on
+2026-11-07, their versions and absence of exact `045E_0B4E` entries were
+unchanged. The indexed MERL file's `__t` value is literally `beta`; the
+program prints this field as the file tag.
+
+Keep any Series reconnect fix independently reviewable from Nano protocol
+work. When proposing upstream changes, scope the claims to the hardware
+evidence actually obtained.
